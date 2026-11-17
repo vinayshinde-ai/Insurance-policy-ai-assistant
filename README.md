@@ -154,7 +154,7 @@ The model is a deployment parameter (`MODEL_ID`). Any Bedrock model that support
 ### Deploy
 
 ```bash
-git clone https://github.com/VinayShinde-Cloud/Insurance-policy-ai-assistant.git
+git clone https://github.com/vinayshinde-ai/Insurance-policy-ai-assistant.git
 cd Insurance-policy-ai-assistant
 scripts/deploy.sh
 ```
