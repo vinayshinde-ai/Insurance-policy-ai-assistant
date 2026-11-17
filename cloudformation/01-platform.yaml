@@ -1,0 +1,689 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Insurance Policy AI Assistant - platform stack (S3, DynamoDB, Cognito, Bedrock Knowledge Base on
+  OpenSearch Serverless, Bedrock Guardrail). Author: Vinay Shinde, Generative AI Engineer
+  (vinayshinde.tech@outlook.com).
+
+Metadata:
+  Author: Vinay Shinde
+  Contact: vinayshinde.tech@outlook.com
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedPattern: "^[a-z][a-z0-9]{1,9}$"
+    Description: Short lowercase environment name, used in resource names.
+  EmbeddingModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+  EmbeddingDimensions:
+    Type: Number
+    Default: 1024
+    AllowedValues: [256, 512, 1024]
+  AossStandbyReplicas:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: ENABLED keeps a standby across AZs (production). DISABLED halves OpenSearch Serverless cost.
+  GroundingThreshold:
+    Type: Number
+    Default: 0.5
+    MinValue: 0
+    MaxValue: 0.99
+  RelevanceThreshold:
+    Type: Number
+    Default: 0.5
+    MinValue: 0
+    MaxValue: 0.99
+  GuardrailVersionDescription:
+    Type: String
+    Default: v1
+    Description: Change this value to publish a new guardrail version after editing the guardrail.
+
+Resources:
+  # ------------------------------------------------------------------ S3
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-logs
+            Status: Enabled
+            ExpirationInDays: 365
+      Tags:
+        - {Key: Project, Value: insurance-policy-ai-assistant}
+        - {Key: Owner, Value: Vinay Shinde}
+        - {Key: Environment, Value: !Ref Environment}
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt AccessLogsBucket.Arn, !Sub "${AccessLogsBucket.Arn}/*"]
+            Condition: {Bool: {"aws:SecureTransport": "false"}}
+          - Sid: S3ServerAccessLogs
+            Effect: Allow
+            Principal: {Service: logging.s3.amazonaws.com}
+            Action: s3:PutObject
+            Resource: !Sub "${AccessLogsBucket.Arn}/s3/*"
+            Condition:
+              StringEquals: {"aws:SourceAccount": !Ref AWS::AccountId}
+          - Sid: AlbAccessLogs
+            Effect: Allow
+            # Elastic Load Balancing account for us-east-1.
+            Principal: {AWS: "arn:aws:iam::127311923021:root"}
+            Action: s3:PutObject
+            Resource: !Sub "${AccessLogsBucket.Arn}/alb/AWSLogs/${AWS::AccountId}/*"
+
+  KnowledgeBaseDocsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration: {Status: Enabled}
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: s3/kb-docs/
+      Tags:
+        - {Key: Project, Value: insurance-policy-ai-assistant}
+        - {Key: Owner, Value: Vinay Shinde}
+        - {Key: Environment, Value: !Ref Environment}
+
+  CustomerPolicyBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration: {Status: Enabled}
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: s3/customer-policy/
+      Tags:
+        - {Key: Project, Value: insurance-policy-ai-assistant}
+        - {Key: Owner, Value: Vinay Shinde}
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: DataClassification, Value: confidential}
+
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration: {Status: Enabled}
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: {NoncurrentDays: 30}
+      Tags:
+        - {Key: Project, Value: insurance-policy-ai-assistant}
+        - {Key: Owner, Value: Vinay Shinde}
+        - {Key: Environment, Value: !Ref Environment}
+
+  KnowledgeBaseDocsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref KnowledgeBaseDocsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt KnowledgeBaseDocsBucket.Arn, !Sub "${KnowledgeBaseDocsBucket.Arn}/*"]
+            Condition: {Bool: {"aws:SecureTransport": "false"}}
+
+  CustomerPolicyBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CustomerPolicyBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt CustomerPolicyBucket.Arn, !Sub "${CustomerPolicyBucket.Arn}/*"]
+            Condition: {Bool: {"aws:SecureTransport": "false"}}
+
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt ArtifactsBucket.Arn, !Sub "${ArtifactsBucket.Arn}/*"]
+            Condition: {Bool: {"aws:SecureTransport": "false"}}
+
+  # ------------------------------------------------------------------ DynamoDB
+  ChatHistoryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: session_id, AttributeType: S}
+        - {AttributeName: ts, AttributeType: N}
+      KeySchema:
+        - {AttributeName: session_id, KeyType: HASH}
+        - {AttributeName: ts, KeyType: RANGE}
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: true
+      Tags:
+        - {Key: Project, Value: insurance-policy-ai-assistant}
+        - {Key: Owner, Value: Vinay Shinde}
+        - {Key: Environment, Value: !Ref Environment}
+
+  # ------------------------------------------------------------------ Cognito
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users"
+      # Open self sign-up with email verification. PreSignUpFunction reserves usernames that have a policy.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      LambdaConfig:
+        PreSignUp: !GetAtt PreSignUpFunction.Arn
+      VerificationMessageTemplate:
+        DefaultEmailOption: CONFIRM_WITH_CODE
+        EmailSubject: Your AnyCompany Insurance Assistant verification code
+        EmailMessage: "Your verification code is {####}. It expires in 24 hours."
+      UsernameConfiguration:
+        CaseSensitive: false
+      AliasAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AccountRecoverySetting:
+        RecoveryMechanisms: [{Name: verified_email, Priority: 1}]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 3
+      UserPoolTier: PLUS
+      UserPoolAddOns:
+        AdvancedSecurityMode: ENFORCED
+      DeletionProtection: ACTIVE
+      UserPoolTags:
+        Project: insurance-policy-ai-assistant
+        Owner: Vinay Shinde
+        Environment: !Ref Environment
+
+  PreSignUpFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: read-customer-policies
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${CustomerPolicyBucket.Arn}/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt CustomerPolicyBucket.Arn
+
+  PreSignUpLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-pre-signup"
+      RetentionInDays: 90
+
+  PreSignUpFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: PreSignUpLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-pre-signup"
+      Description: Open self sign-up; blocks usernames reserved for customers with a policy on file.
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 10
+      MemorySize: 128
+      Role: !GetAtt PreSignUpFunctionRole.Arn
+      Environment:
+        Variables:
+          POLICY_BUCKET: !Ref CustomerPolicyBucket
+      Code:
+        ZipFile: |
+          import json, os, re
+          import boto3
+          from botocore.exceptions import ClientError
+
+          s3 = boto3.client("s3")
+          USERNAME_RE = re.compile(r"^[a-z0-9_.-]{3,64}$")
+          INVALID = "Username must be 3-64 characters: lowercase letters, numbers, '.', '_' or '-'."
+          RESERVED = "That username isn't available. Please choose another."
+
+          def policy_exists(username):
+              try:
+                  s3.head_object(Bucket=os.environ["POLICY_BUCKET"], Key=f"{username}.txt")
+                  return True
+              except ClientError as e:
+                  if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+                      return False
+                  raise  # fail closed on unexpected S3 errors
+
+          def handler(event, context):
+              if event.get("triggerSource") != "PreSignUp_SignUp":
+                  return event  # admin-created users are trusted
+              username = event.get("userName", "")
+              if not USERNAME_RE.fullmatch(username):
+                  print(json.dumps({"result": "invalid_username", "username": username[:64]}))
+                  raise Exception(INVALID)
+              # Policy files are matched by username, so usernames with a policy are reserved for that
+              # customer and can only be created by an admin.
+              if policy_exists(username):
+                  print(json.dumps({"result": "reserved", "username": username}))
+                  raise Exception(RESERVED)
+              print(json.dumps({"result": "allowed", "username": username}))
+              return event
+      Tags:
+        - {Key: Project, Value: insurance-policy-ai-assistant}
+        - {Key: Owner, Value: Vinay Shinde}
+
+  PreSignUpPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PreSignUpFunction
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+      SourceAccount: !Ref AWS::AccountId
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${AWS::StackName}-web"
+      GenerateSecret: false
+      # streamlit-cognito-auth signs in with SRP.
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  # ------------------------------------------------------------------ OpenSearch Serverless vector store
+  # Every collection needs an encryption policy. AWSOwnedKey keeps the service default; no KMS key is created.
+  AossEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "ins-kb-${Environment}-enc"
+      Type: encryption
+      Policy: !Sub '{"Rules":[{"ResourceType":"collection","Resource":["collection/ins-kb-${Environment}"]}],"AWSOwnedKey":true}'
+
+  AossNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "ins-kb-${Environment}-net"
+      Type: network
+      # Endpoint is reachable from the internet but every request needs SigV4 auth plus the data access policy below.
+      Policy: !Sub '[{"Rules":[{"ResourceType":"collection","Resource":["collection/ins-kb-${Environment}"]}],"AllowFromPublic":true}]'
+
+  AossDataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: !Sub "ins-kb-${Environment}-access"
+      Type: data
+      Policy: !Sub
+        - '[{"Rules":[{"ResourceType":"collection","Resource":["collection/ins-kb-${Environment}"],"Permission":["aoss:DescribeCollectionItems","aoss:CreateCollectionItems","aoss:UpdateCollectionItems"]},{"ResourceType":"index","Resource":["index/ins-kb-${Environment}/*"],"Permission":["aoss:CreateIndex","aoss:DeleteIndex","aoss:UpdateIndex","aoss:DescribeIndex","aoss:ReadDocument","aoss:WriteDocument"]}],"Principal":["${KbRole}","${IndexRole}"]}]'
+        - KbRole: !GetAtt KnowledgeBaseRole.Arn
+          IndexRole: !GetAtt IndexFunctionRole.Arn
+
+  VectorCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn: [AossEncryptionPolicy, AossNetworkPolicy]
+    Properties:
+      Name: !Sub "ins-kb-${Environment}"
+      Type: VECTORSEARCH
+      StandbyReplicas: !Ref AossStandbyReplicas
+      Description: Vector store for general insurance policy documents
+      Tags:
+        - {Key: Project, Value: insurance-policy-ai-assistant}
+        - {Key: Owner, Value: Vinay Shinde}
+        - {Key: Environment, Value: !Ref Environment}
+
+  # Creates the k-NN index Bedrock needs before the Knowledge Base can be created.
+  IndexFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: aoss-api
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: aoss:APIAccessAll
+                Resource: !Sub "arn:${AWS::Partition}:aoss:${AWS::Region}:${AWS::AccountId}:collection/*"
+
+  IndexFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-vector-index"
+      RetentionInDays: 30
+
+  IndexFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: IndexFunctionLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-vector-index"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 900
+      MemorySize: 256
+      Role: !GetAtt IndexFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import json, time, urllib.request, urllib.error, hashlib, os
+          import boto3
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+
+          SUCCESS, FAILED = "SUCCESS", "FAILED"
+
+          def send(event, context, status, physical_id, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": (reason or "See log stream " + context.log_stream_name)[:500],
+                  "PhysicalResourceId": physical_id,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": {},
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"Content-Type": "", "Content-Length": str(len(body))})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  print("cfn response", status, r.status)
+
+          def call(method, url, body=None):
+              data = json.dumps(body).encode() if body is not None else b""
+              headers = {"Content-Type": "application/json",
+                         "X-Amz-Content-Sha256": hashlib.sha256(data).hexdigest()}
+              req = AWSRequest(method=method, url=url, data=data, headers=headers)
+              SigV4Auth(boto3.Session().get_credentials(), "aoss", os.environ["AWS_REGION"]).add_auth(req)
+              r = urllib.request.Request(url, data=data or None, method=method, headers=dict(req.headers))
+              try:
+                  with urllib.request.urlopen(r, timeout=30) as resp:
+                      return resp.status, resp.read().decode()
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode()
+
+          def handler(event, context):
+              props = event["ResourceProperties"]
+              url = f'{props["Endpoint"]}/{props["IndexName"]}'
+              physical_id = props["IndexName"]
+              try:
+                  if event["RequestType"] == "Create":
+                      body = {
+                          "settings": {"index": {"knn": True, "knn.algo_param.ef_search": 512}},
+                          "mappings": {"properties": {
+                              props["VectorField"]: {"type": "knn_vector", "dimension": int(props["Dimensions"]),
+                                  "method": {"name": "hnsw", "engine": "faiss", "space_type": "l2",
+                                             "parameters": {"ef_construction": 512, "m": 16}}},
+                              props["TextField"]: {"type": "text"},
+                              props["MetadataField"]: {"type": "text", "index": False}}}}
+                      # Data access policies can take a minute or two to apply, so retry 403s.
+                      deadline = time.time() + 600
+                      while True:
+                          status, text = call("PUT", url, body)
+                          print("create index", status, text[:500])
+                          if status < 300 or "resource_already_exists_exception" in text:
+                              break
+                          if time.time() > deadline:
+                              raise RuntimeError(f"Index creation failed: {status} {text[:300]}")
+                          time.sleep(15)
+                      time.sleep(60)  # let the index become visible before Bedrock validates it
+                  elif event["RequestType"] == "Delete":
+                      status, text = call("DELETE", url)
+                      print("delete index", status, text[:300])
+                  send(event, context, SUCCESS, physical_id)
+              except Exception as e:
+                  print("error", repr(e))
+                  send(event, context, FAILED, physical_id, str(e))
+      Tags:
+        - {Key: Project, Value: insurance-policy-ai-assistant}
+        - {Key: Owner, Value: Vinay Shinde}
+
+  VectorIndex:
+    Type: Custom::AossVectorIndex
+    DependsOn: [AossDataAccessPolicy]
+    Properties:
+      ServiceToken: !GetAtt IndexFunction.Arn
+      # Fail after 15 minutes instead of the 1 hour default if the function never responds.
+      ServiceTimeout: 900
+      Endpoint: !GetAtt VectorCollection.CollectionEndpoint
+      IndexName: insurance-policy-index
+      VectorField: bedrock-kb-vector
+      TextField: AMAZON_BEDROCK_TEXT_CHUNK
+      MetadataField: AMAZON_BEDROCK_METADATA
+      Dimensions: !Ref EmbeddingDimensions
+
+  # ------------------------------------------------------------------ Bedrock Knowledge Base
+  KnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: bedrock.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: {"aws:SourceAccount": !Ref AWS::AccountId}
+              ArnLike: {"aws:SourceArn": !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"}
+      Policies:
+        - PolicyName: kb-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}"
+              - Effect: Allow
+                Action: aoss:APIAccessAll
+                Resource: !Sub "arn:${AWS::Partition}:aoss:${AWS::Region}:${AWS::AccountId}:collection/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt KnowledgeBaseDocsBucket.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${KnowledgeBaseDocsBucket.Arn}/*"
+
+  KnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    DependsOn: VectorIndex
+    Properties:
+      Name: !Sub "${AWS::StackName}-kb"
+      Description: General motor insurance policy documents (terms, conditions, FAQs).
+      RoleArn: !GetAtt KnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}"
+          EmbeddingModelConfiguration:
+            BedrockEmbeddingModelConfiguration:
+              Dimensions: !Ref EmbeddingDimensions
+      StorageConfiguration:
+        Type: OPENSEARCH_SERVERLESS
+        OpensearchServerlessConfiguration:
+          CollectionArn: !GetAtt VectorCollection.Arn
+          VectorIndexName: insurance-policy-index
+          FieldMapping:
+            VectorField: bedrock-kb-vector
+            TextField: AMAZON_BEDROCK_TEXT_CHUNK
+            MetadataField: AMAZON_BEDROCK_METADATA
+      Tags:
+        Project: insurance-policy-ai-assistant
+        Owner: Vinay Shinde
+        Environment: !Ref Environment
+
+  KnowledgeBaseDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      Name: insurance-policy-docs
+      KnowledgeBaseId: !Ref KnowledgeBase
+      # RETAIN avoids delete failures when the vector index is removed in the same stack deletion.
+      DataDeletionPolicy: RETAIN
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt KnowledgeBaseDocsBucket.Arn
+      VectorIngestionConfiguration:
+        ChunkingConfiguration:
+          ChunkingStrategy: FIXED_SIZE
+          FixedSizeChunkingConfiguration:
+            MaxTokens: 300
+            OverlapPercentage: 20
+
+  # ------------------------------------------------------------------ Bedrock Guardrail
+  Guardrail:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: !Sub "${AWS::StackName}-guardrail"
+      Description: Safety, prompt-attack and grounding controls for the insurance assistant.
+      BlockedInputMessaging: >-
+        I can only help with questions about your AnyCompany motor insurance policy. Please rephrase your
+        question, or email insurance-queries@anycompany.com.
+      BlockedOutputsMessaging: >-
+        I couldn't find a reliable answer to that in your policy documents. Please rephrase your question,
+        or email insurance-queries@anycompany.com.
+      ContentPolicyConfig:
+        FiltersConfig:
+          - {Type: HATE, InputStrength: HIGH, OutputStrength: HIGH}
+          - {Type: SEXUAL, InputStrength: HIGH, OutputStrength: HIGH}
+          - {Type: VIOLENCE, InputStrength: HIGH, OutputStrength: HIGH}
+          - {Type: INSULTS, InputStrength: HIGH, OutputStrength: HIGH}
+          - {Type: MISCONDUCT, InputStrength: HIGH, OutputStrength: HIGH}
+          - {Type: PROMPT_ATTACK, InputStrength: HIGH, OutputStrength: NONE}
+      WordPolicyConfig:
+        ManagedWordListsConfig:
+          - {Type: PROFANITY}
+      ContextualGroundingPolicyConfig:
+        FiltersConfig:
+          - {Type: GROUNDING, Threshold: !Ref GroundingThreshold}
+          - {Type: RELEVANCE, Threshold: !Ref RelevanceThreshold}
+      Tags:
+        - {Key: Project, Value: insurance-policy-ai-assistant}
+        - {Key: Owner, Value: Vinay Shinde}
+        - {Key: Environment, Value: !Ref Environment}
+
+  GuardrailVersion:
+    Type: AWS::Bedrock::GuardrailVersion
+    Properties:
+      GuardrailIdentifier: !GetAtt Guardrail.GuardrailId
+      Description: !Ref GuardrailVersionDescription
+
+Outputs:
+  KnowledgeBaseId:
+    Value: !Ref KnowledgeBase
+    Export: {Name: !Sub "${AWS::StackName}-KnowledgeBaseId"}
+  KnowledgeBaseArn:
+    Value: !GetAtt KnowledgeBase.KnowledgeBaseArn
+    Export: {Name: !Sub "${AWS::StackName}-KnowledgeBaseArn"}
+  DataSourceId:
+    Value: !GetAtt KnowledgeBaseDataSource.DataSourceId
+  GuardrailId:
+    Value: !GetAtt Guardrail.GuardrailId
+    Export: {Name: !Sub "${AWS::StackName}-GuardrailId"}
+  GuardrailArn:
+    Value: !GetAtt Guardrail.GuardrailArn
+    Export: {Name: !Sub "${AWS::StackName}-GuardrailArn"}
+  GuardrailVersion:
+    Value: !GetAtt GuardrailVersion.Version
+    Export: {Name: !Sub "${AWS::StackName}-GuardrailVersion"}
+  KnowledgeBaseDocsBucketName:
+    Value: !Ref KnowledgeBaseDocsBucket
+  CustomerPolicyBucketName:
+    Value: !Ref CustomerPolicyBucket
+    Export: {Name: !Sub "${AWS::StackName}-CustomerPolicyBucket"}
+  ArtifactsBucketName:
+    Value: !Ref ArtifactsBucket
+    Export: {Name: !Sub "${AWS::StackName}-ArtifactsBucket"}
+  AccessLogsBucketName:
+    Value: !Ref AccessLogsBucket
+    Export: {Name: !Sub "${AWS::StackName}-AccessLogsBucket"}
+  ChatHistoryTableName:
+    Value: !Ref ChatHistoryTable
+    Export: {Name: !Sub "${AWS::StackName}-ChatHistoryTable"}
+  ChatHistoryTableArn:
+    Value: !GetAtt ChatHistoryTable.Arn
+    Export: {Name: !Sub "${AWS::StackName}-ChatHistoryTableArn"}
+  UserPoolId:
+    Value: !Ref UserPool
+    Export: {Name: !Sub "${AWS::StackName}-UserPoolId"}
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+    Export: {Name: !Sub "${AWS::StackName}-UserPoolClientId"}
