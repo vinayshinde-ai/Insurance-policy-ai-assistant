@@ -74,7 +74,9 @@ Measured on the deployed environment in us-east-1:
 
 ## Architecture
 
-![Architecture](Insurance_GTM_Architecture.jpg)
+![Architecture](docs/architecture.png)
+
+*Editable source: [docs/architecture.drawio](docs/architecture.drawio) (open in [draw.io](https://app.diagrams.net)).*
 
 ### Request flow
 
